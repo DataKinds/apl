@@ -128,6 +128,8 @@ Bottom line: let's make the best fucking calculator ever.
 * Namespaces, modules, imports
     * The assignment logic is already going to be very complicated -- we'll need special cases for verbs, adjectives (higher order verbs), and nouns. 
     * The compiler's token expansion pass needs to be able to declaratively determine names to expand them
+    * The parser itself also needs to be able to statically determine the part of speech of every name in order to parse accurately
+    * So modules make the situation more complicated
 * Stability, compatiblity with other APLs
 * Ergonomics over performance
     * Running on GHC is an explicit choice -- we have access to a very fast GC and RTS, we can afford to abuse it.
