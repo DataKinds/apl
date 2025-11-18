@@ -14,11 +14,15 @@ import Data.GADT.Show.TH (deriveGShow)
 import Data.Some
 import Data.Coerce (coerce)
 import Data.Dynamic 
+import Debug.Trace
+import Data.Maybe (isJust, isNothing)
+import Control.Monad (foldM)
+import Data.Functor ((<&>))
 
 
-newtype FileContents = FileContents String
-newtype Tokenized = Tokenized [String]
-newtype Parsed = Parsed [String]
+newtype FileContents = FileContents String deriving (Show)
+newtype Tokenized = Tokenized [String] deriving (Show)
+newtype Parsed = Parsed [String] deriving (Show)
 -- | GADT describing queries the compiler can respond to.
 data Query a where -- a is the return value of the query
     QFileRead :: String -> Query FileContents
@@ -26,6 +30,8 @@ data Query a where -- a is the return value of the query
     QParseFile :: Query Tokenized -> Query Parsed
 deriving instance Eq (Query a)
 deriving instance Ord (Query a)
+deriving instance Show (Query a)
+deriving instance Typeable (Query a)
 deriveGEq ''Query
 deriveGCompare ''Query
 deriveGShow ''Query
@@ -70,9 +76,10 @@ route = \case
 
 -- | Interface and implementation for an object which caches query requests
 class MonadIO m => Cache m where
-    fetch :: Query a -> m a
+    fetch :: (Typeable a, Show a) => Query a -> m a
     store :: Query a -> a -> m ()
     invalidate :: Query a -> m ()
+    isStale :: Query a -> m Bool
 
 newtype QueryCache = QueryCache { unQueryCache :: D.DMap Query Identity }
 
@@ -81,24 +88,46 @@ instance (MonadIO m, MonadState QueryCache m) => Cache m where
     store query payload = modify (QueryCache . D.insert query (pure payload) . unQueryCache)
     invalidate :: MonadState QueryCache m => Query a -> m ()
     invalidate query = modify (QueryCache . D.delete query . unQueryCache)
-    fetch :: MonadState QueryCache m => Query a -> m a
+    isStale :: MonadState QueryCache m => Query a -> m Bool
+    isStale query = get >>= (pure . isNothing . D.lookup query . unQueryCache)
+    fetch :: (Typeable a, Show a, MonadState QueryCache m) => Query a -> m a
     fetch query = do
-        c <- unQueryCache <$> get
-        case D.lookup query c of
-            Just x -> pure . runIdentity $ x
-            Nothing -> do
-                payload <- route query 
-                store query payload
-                pure payload
+        liftIO $ traceIO ("Fetching " ++ show query)
+        let deps = depends query
+            deps' = pure <$> deps :: [m (Some Query)]
+            depsStale = deps' <&> \dep -> withSomeM dep isStale
+        needsUpdate <- sequence depsStale
+        let stale = or needsUpdate
+        liftIO $ traceIO (" ... with deps " ++ show deps)
+        liftIO $ traceIO (" ... stale?    " ++ show needsUpdate ++ if stale then " => Yup" else " => Nope")
+        if stale then do
+            payload <- route query 
+            store query payload
+            traceM ("Cache outcome: stale dep! " ++ show (toDyn payload) ++ " " ++ show payload)
+            pure payload
+        else do
+            cache <- unQueryCache <$> get
+            case D.lookup query cache of
+                Just (Identity payload) -> do
+                    traceM ("Cache outcome: hit! " ++ show (toDyn payload) ++ " " ++ show payload)
+                    pure payload
+                Nothing -> do
+                    payload <- route query 
+                    store query payload
+                    traceM ("Cache outcome: miss! " ++ show (toDyn payload) ++ " " ++ show payload)
+                    pure payload
 
 concrete :: StateT QueryCache IO ()
 concrete = do
-    str1 <- fetch (QFileRead "hello-world.txt")
-    str2 <- fetch (QFileRead "hello-world.txt")
-    str3 <- fetch (QFileRead "hello-world.txt")
-    str4 <- fetch (QTokenizeFile $ QFileRead "hello-world.txt")
-    str5 <- fetch (QParseFile . QTokenizeFile $ QFileRead "hello-world.txt")
-    liftIO . putStrLn $ "Got the following files:\n" ++ (unlines $ show <$> [toDyn str1, toDyn str2, toDyn str3, toDyn str4, toDyn str5])
+    liftIO $ putStrLn "\n#### RUN 1 #### NO CACHE ####"
+    let fileq = QFileRead "hello-world.txt"
+    _ <- fetch (QParseFile . QTokenizeFile $ fileq)
+    liftIO $ putStrLn "\n#### RUN 2 #### FULLY CACHED ####"
+    _ <- fetch (QParseFile . QTokenizeFile $ fileq)
+    liftIO $ putStrLn "\n#### RUN 3 #### INVALIDATED INNER CACHE ####"
+    invalidate fileq
+    _ <- fetch (QParseFile . QTokenizeFile $ fileq)
+    pure ()
 
 main :: IO ()
 main = evalStateT concrete (QueryCache mempty)
