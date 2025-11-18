@@ -69,7 +69,11 @@ executable gaypl
     -- Other library packages from which modules are imported.
     build-depends:    
         base,
-        megaparsec 
+        some,
+        dependent-map,
+        dependent-sum,
+        dependent-sum-template,
+        mtl
 
     -- Directories containing source files.
     hs-source-dirs:   app
