@@ -71,6 +71,7 @@ executable gaypl
         base,
         some,
         dependent-map,
+        containers,
         dependent-sum,
         dependent-sum-template,
         mtl
