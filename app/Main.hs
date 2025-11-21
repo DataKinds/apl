@@ -7,6 +7,8 @@
 {-# LANGUAGE ImpredicativeTypes #-}
 module Main where
 import qualified Data.Dependent.Map as D
+import qualified Data.Map as M
+import qualified Data.Set as S
 import Data.Functor.Identity (Identity (..))
 import Control.Monad.State.Lazy 
 import Data.GADT.Compare.TH (deriveGCompare, deriveGEq)
@@ -61,47 +63,65 @@ depends :: Query a -> [Some Query]
 depends = depends' . mkSome
 
 -- | Actually carry out a query described by the GADT above
-route :: Cache m => Query a -> m a 
-route = \case
+coldFetch :: Cache m => Query a -> m a 
+coldFetch query = let fetch' = fetchDep query in case query of
     QFileRead filepath -> liftIO $ do
         putStrLn ("!! DOING IO TO GRAB FILE " ++ filepath ++ " !!")
         contents <- readFile filepath
         pure $ FileContents contents
     QTokenizeFile fileq -> do
-        fileContents <- fetch fileq
+        fileContents <- fetch' fileq
         pure $ Tokenized []
     QParseFile tokenq -> do
-        tokens <- fetch tokenq
+        tokens <- fetch' tokenq
         pure $ Parsed []
 
 -- | Interface and implementation for an object which caches query requests
 class MonadIO m => Cache m where
     fetch :: (Typeable a, Show a) => Query a -> m a
+    fetchDep :: (Typeable b, Show b) => Query a -> Query b -> m b -- Fetch dependency with context
     store :: Query a -> a -> m ()
-    invalidate :: Query a -> m ()
-    isStale :: Query a -> m Bool
+    storeDep :: Query a -> Query b -> m () -- Set dependency on query
+    invalidate :: Query a -> m () -- remove cached value and deps
 
-newtype QueryCache = QueryCache { unQueryCache :: D.DMap Query Identity }
+data QueryCache = QueryCache { 
+    unQueryCache :: D.DMap Query Identity,
+    unDepCache :: M.Map (Some Query) (S.Set (Some Query))
+}
 
 instance (MonadIO m, MonadState QueryCache m) => Cache m where
     store :: MonadState QueryCache m => Query a -> a -> m ()
-    store query payload = modify (QueryCache . D.insert query (pure payload) . unQueryCache)
+    store query payload = modify (\qc -> qc { unQueryCache = D.insert query (pure payload) . unQueryCache $ qc })
+
+    storeDep :: MonadState QueryCache m => Query a -> Query b -> m ()
+    storeDep parent dep = modify (\qc -> qc { unDepCache = M.update (pure . S.insert (mkSome dep)) (mkSome parent) . unDepCache $ qc })
+
+
     invalidate :: MonadState QueryCache m => Query a -> m ()
-    invalidate query = modify (QueryCache . D.delete query . unQueryCache)
-    isStale :: MonadState QueryCache m => Query a -> m Bool
-    isStale query = get >>= (pure . isNothing . D.lookup query . unQueryCache)
+    invalidate query = modify (\qc -> qc { 
+        unQueryCache = D.delete query . unQueryCache $ qc,
+        unDepCache = M.delete (mkSome query) . unDepCache $ qc
+     })
+
+    fetchDep :: (Typeable b, Show b) => Query a -> Query b -> m b
+    fetchDep ctx query = do
+
+        fetch query
+
     fetch :: (Typeable a, Show a, MonadState QueryCache m) => Query a -> m a
     fetch query = do
         liftIO $ traceIO ("Fetching " ++ show query)
         let deps = depends query
             deps' = pure <$> deps :: [m (Some Query)]
+            isStale :: MonadState QueryCache m => Query a -> m Bool
+            isStale query = get >>= (pure . isNothing . D.lookup query . unQueryCache)
             depsStale = deps' <&> \dep -> withSomeM dep isStale
         needsUpdate <- sequence depsStale
         let stale = or needsUpdate
         liftIO $ traceIO (" ... with deps " ++ show deps)
         liftIO $ traceIO (" ... stale?    " ++ show needsUpdate ++ if stale then " => Yup" else " => Nope")
         if stale then do
-            payload <- route query 
+            payload <- coldFetch query 
             store query payload
             traceM ("Cache outcome: stale dep! " ++ show (toDyn payload) ++ " " ++ show payload)
             pure payload
@@ -112,7 +132,7 @@ instance (MonadIO m, MonadState QueryCache m) => Cache m where
                     traceM ("Cache outcome: hit! " ++ show (toDyn payload) ++ " " ++ show payload)
                     pure payload
                 Nothing -> do
-                    payload <- route query 
+                    payload <- coldFetch query 
                     store query payload
                     traceM ("Cache outcome: miss! " ++ show (toDyn payload) ++ " " ++ show payload)
                     pure payload
@@ -130,4 +150,4 @@ concrete = do
     pure ()
 
 main :: IO ()
-main = evalStateT concrete (QueryCache mempty)
+main = evalStateT concrete (QueryCache mempty mempty)
